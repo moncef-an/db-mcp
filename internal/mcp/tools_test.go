@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -12,8 +13,10 @@ import (
 )
 
 type mockRepo struct {
-	listTablesFn    func(ctx context.Context, schema string) ([]db.TableSummary, error)
-	describeTableFn func(ctx context.Context, schema, table string) (*db.TableSchema, error)
+	listTablesFn           func(ctx context.Context, schema string) ([]db.TableSummary, error)
+	describeTableFn        func(ctx context.Context, schema, table string) (*db.TableSchema, error)
+	executeReadOnlyQueryFn func(ctx context.Context, query string, maxRows int) (*db.QueryResult, error)
+	explainQueryFn         func(ctx context.Context, query string, analyze bool) (*db.ExplainResult, error)
 }
 
 func (m *mockRepo) Ping(context.Context) error { return nil }
@@ -33,11 +36,17 @@ func (m *mockRepo) DescribeTable(ctx context.Context, schema, table string) (*db
 	return nil, nil
 }
 
-func (m *mockRepo) ExecuteReadOnlyQuery(context.Context, string, int) (*db.QueryResult, error) {
+func (m *mockRepo) ExecuteReadOnlyQuery(ctx context.Context, query string, maxRows int) (*db.QueryResult, error) {
+	if m.executeReadOnlyQueryFn != nil {
+		return m.executeReadOnlyQueryFn(ctx, query, maxRows)
+	}
 	return nil, errors.New("not implemented")
 }
 
-func (m *mockRepo) ExplainQuery(context.Context, string, bool) (*db.ExplainResult, error) {
+func (m *mockRepo) ExplainQuery(ctx context.Context, query string, analyze bool) (*db.ExplainResult, error) {
+	if m.explainQueryFn != nil {
+		return m.explainQueryFn(ctx, query, analyze)
+	}
 	return nil, errors.New("not implemented")
 }
 
@@ -168,6 +177,138 @@ func TestHandleDescribeTable(t *testing.T) {
 		}
 		if !reflect.DeepEqual(out, want) {
 			t.Fatalf("DescribeTable output = %+v, want %+v", out, want)
+		}
+	})
+}
+
+func TestHandleRunQuery(t *testing.T) {
+	t.Run("guard blocks DROP TABLE without calling repo", func(t *testing.T) {
+		called := false
+		srv := NewServer(&mockRepo{
+			executeReadOnlyQueryFn: func(context.Context, string, int) (*db.QueryResult, error) {
+				called = true
+				return nil, nil
+			},
+		}, &config.Config{MaxRows: 100}, nil)
+
+		res, _, err := srv.handleRunQuery(context.Background(), nil, RunQueryInput{SQL: "DROP TABLE users"})
+		if err != nil {
+			t.Fatalf("unexpected Go error: %v", err)
+		}
+		if called {
+			t.Fatal("expected guard to block query before calling repository")
+		}
+		if res == nil || !res.IsError {
+			t.Fatalf("expected IsError=true, got %+v", res)
+		}
+	})
+
+	t.Run("clamps limit and redacts sensitive columns", func(t *testing.T) {
+		var gotMaxRows int
+		srv := NewServer(&mockRepo{
+			executeReadOnlyQueryFn: func(_ context.Context, _ string, maxRows int) (*db.QueryResult, error) {
+				gotMaxRows = maxRows
+				return &db.QueryResult{
+					Columns:         []string{"id", "email", "password_hash"},
+					Rows:            [][]any{{1, "alice@example.com", "secret-hash"}},
+					RowCount:        1,
+					Truncated:       false,
+					ExecutionTimeMs: 3,
+				}, nil
+			},
+		}, &config.Config{
+			MaxRows:       50,
+			RedactColumns: []string{"password_hash", "token"},
+		}, nil)
+
+		res, out, err := srv.handleRunQuery(context.Background(), nil, RunQueryInput{
+			SQL:   "SELECT id, email, password_hash FROM users",
+			Limit: 9999,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res != nil && res.IsError {
+			t.Fatalf("expected IsError=false, got %+v", res)
+		}
+		if gotMaxRows != 50 {
+			t.Errorf("maxRows passed to repo = %d, want 50", gotMaxRows)
+		}
+		wantRows := [][]any{{1, "alice@example.com", "[REDACTED]"}}
+		if !reflect.DeepEqual(out.Rows, wantRows) {
+			t.Errorf("Rows = %#v, want %#v", out.Rows, wantRows)
+		}
+	})
+
+	t.Run("repo error returns IsError true", func(t *testing.T) {
+		srv := NewServer(&mockRepo{
+			executeReadOnlyQueryFn: func(context.Context, string, int) (*db.QueryResult, error) {
+				return nil, context.DeadlineExceeded
+			},
+		}, &config.Config{MaxRows: 100}, nil)
+
+		res, _, err := srv.handleRunQuery(context.Background(), nil, RunQueryInput{SQL: "SELECT 1"})
+		if err != nil {
+			t.Fatalf("unexpected Go error: %v", err)
+		}
+		if res == nil || !res.IsError {
+			t.Fatalf("expected IsError=true, got %+v", res)
+		}
+	})
+}
+
+func TestHandleExplainQuery(t *testing.T) {
+	t.Run("guard blocks DELETE and leading EXPLAIN without calling repo", func(t *testing.T) {
+		for _, badSQL := range []string{"DELETE FROM users", "EXPLAIN SELECT 1"} {
+			called := false
+			srv := NewServer(&mockRepo{
+				explainQueryFn: func(context.Context, string, bool) (*db.ExplainResult, error) {
+					called = true
+					return nil, nil
+				},
+			}, &config.Config{MaxRows: 100}, nil)
+
+			res, _, err := srv.handleExplainQuery(context.Background(), nil, ExplainQueryInput{SQL: badSQL})
+			if err != nil {
+				t.Fatalf("unexpected Go error: %v", err)
+			}
+			if called {
+				t.Fatalf("expected guard to block %q before calling repo", badSQL)
+			}
+			if res == nil || !res.IsError {
+				t.Fatalf("expected IsError=true for %q, got %+v", badSQL, res)
+			}
+		}
+	})
+
+	t.Run("forwards analyze flag and preserves json.RawMessage plan", func(t *testing.T) {
+		wantPlan := json.RawMessage(`[{"Plan":{"Node Type":"Seq Scan"}}]`)
+		var gotAnalyze bool
+		srv := NewServer(&mockRepo{
+			explainQueryFn: func(_ context.Context, _ string, analyze bool) (*db.ExplainResult, error) {
+				gotAnalyze = analyze
+				return &db.ExplainResult{
+					Plan:            wantPlan,
+					ExecutionTimeMs: 7,
+				}, nil
+			},
+		}, &config.Config{MaxRows: 100}, nil)
+
+		res, out, err := srv.handleExplainQuery(context.Background(), nil, ExplainQueryInput{
+			SQL:     "SELECT * FROM users",
+			Analyze: true,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res != nil && res.IsError {
+			t.Fatalf("expected IsError=false, got %+v", res)
+		}
+		if !gotAnalyze {
+			t.Error("expected analyze=true to be forwarded to repo")
+		}
+		if string(out.Plan) != string(wantPlan) {
+			t.Errorf("Plan = %s, want %s", string(out.Plan), string(wantPlan))
 		}
 	})
 }

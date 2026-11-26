@@ -3,11 +3,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/moncef-an/db-mcp/internal/db"
@@ -132,9 +133,7 @@ func (r *Repository) ExecuteReadOnlyQuery(ctx context.Context, query string, max
 			}
 
 			for i, v := range vals {
-				if b, ok := v.([]byte); ok {
-					vals[i] = string(b)
-				}
+				vals[i] = normalizeValue(v)
 			}
 			resultRows = append(resultRows, vals)
 		}
@@ -377,7 +376,47 @@ func (r *Repository) DescribeTable(ctx context.Context, schema, table string) (*
 	return result, nil
 }
 
-// ExplainQuery will be implemented in Phase 4.
-func (r *Repository) ExplainQuery(_ context.Context, _ string, _ bool) (*db.ExplainResult, error) {
-	return nil, errors.New("explain_query not implemented")
+// ExplainQuery runs EXPLAIN (FORMAT JSON) or EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+// inside a rolled-back read-only transaction.
+func (r *Repository) ExplainQuery(ctx context.Context, query string, analyze bool) (*db.ExplainResult, error) {
+	prefix := "EXPLAIN (FORMAT JSON) "
+	if analyze {
+		prefix = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+	}
+
+	start := time.Now()
+	var rawPlan []byte
+
+	err := r.withReadOnlyTx(ctx, func(txCtx context.Context, tx *sql.Tx) error {
+		if err := tx.QueryRowContext(txCtx, prefix+query).Scan(&rawPlan); err != nil {
+			return fmt.Errorf("explain query: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &db.ExplainResult{
+		Plan:            json.RawMessage(rawPlan),
+		ExecutionTimeMs: time.Since(start).Milliseconds(),
+	}, nil
+}
+
+// normalizeValue converts database/sql scanned values into JSON-friendly primitives.
+func normalizeValue(v any) any {
+	switch val := v.(type) {
+	case nil:
+		return nil
+	case []byte:
+		if utf8.Valid(val) {
+			return string(val)
+		}
+		return val
+	case [16]byte:
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			val[0:4], val[4:6], val[6:8], val[8:10], val[10:16])
+	default:
+		return val
+	}
 }

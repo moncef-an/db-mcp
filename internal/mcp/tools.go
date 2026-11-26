@@ -8,18 +8,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/moncef-an/db-mcp/internal/db"
+	"github.com/moncef-an/db-mcp/internal/guard"
 )
-
-// PingInput defines the input schema for the temporary ping tool.
-type PingInput struct {
-	Message string `json:"message,omitempty" jsonschema:"Optional message to echo back"`
-}
-
-// PingOutput defines the structured output schema for the temporary ping tool.
-type PingOutput struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
-}
 
 // ListTablesInput defines the input schema for list_tables.
 type ListTablesInput struct {
@@ -38,12 +28,19 @@ type DescribeTableInput struct {
 	Schema string `json:"schema,omitempty" jsonschema:"PostgreSQL schema name (defaults to public)"`
 }
 
-func (s *Server) registerTools() {
-	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "ping",
-		Description: "Verify that the db-mcp server is running and responsive over stdio.",
-	}, s.handlePing)
+// RunQueryInput defines the input schema for run_query.
+type RunQueryInput struct {
+	SQL   string `json:"sql" jsonschema:"Read-only SQL SELECT or WITH query to execute (required)"`
+	Limit int    `json:"limit,omitempty" jsonschema:"Maximum number of rows to return (clamped to server max_rows)"`
+}
 
+// ExplainQueryInput defines the input schema for explain_query.
+type ExplainQueryInput struct {
+	SQL     string `json:"sql" jsonschema:"Read-only SQL SELECT or WITH query to explain without a leading EXPLAIN (required)"`
+	Analyze bool   `json:"analyze,omitempty" jsonschema:"If true, runs EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) inside a rolled-back read-only transaction"`
+}
+
+func (s *Server) registerTools() {
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "list_tables",
 		Description: "List all tables and views in a PostgreSQL schema with estimated row counts.",
@@ -53,22 +50,16 @@ func (s *Server) registerTools() {
 		Name:        "describe_table",
 		Description: "Inspect columns, data types, nullability, defaults, primary keys, foreign keys, and indexes for a table.",
 	}, s.handleDescribeTable)
-}
 
-func (s *Server) handlePing(_ context.Context, _ *mcp.CallToolRequest, in PingInput) (*mcp.CallToolResult, PingOutput, error) {
-	msg := strings.TrimSpace(in.Message)
-	if len(msg) > 256 {
-		return toolError("message exceeds 256 character limit"), PingOutput{}, nil
-	}
-	if msg == "" {
-		msg = "pong"
-	}
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "run_query",
+		Description: "Execute a read-only SQL SELECT or WITH query and return bounded, redacted tabular results.",
+	}, s.handleRunQuery)
 
-	s.logger.Debug("handled ping tool call", "message_len", len(msg))
-	return nil, PingOutput{
-		Status:  "ok",
-		Message: msg,
-	}, nil
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "explain_query",
+		Description: "Inspect PostgreSQL's JSON execution plan for a read-only SELECT or WITH query.",
+	}, s.handleExplainQuery)
 }
 
 func (s *Server) handleListTables(ctx context.Context, _ *mcp.CallToolRequest, in ListTablesInput) (*mcp.CallToolResult, ListTablesOutput, error) {
@@ -115,6 +106,47 @@ func (s *Server) handleDescribeTable(ctx context.Context, _ *mcp.CallToolRequest
 
 	s.logger.Debug("handled describe_table", "schema", schema, "table", table)
 	return nil, desc, nil
+}
+
+func (s *Server) handleRunQuery(ctx context.Context, _ *mcp.CallToolRequest, in RunQueryInput) (*mcp.CallToolResult, *db.QueryResult, error) {
+	if err := guard.ValidateReadOnlyQuery(in.SQL); err != nil {
+		s.logger.Warn("run_query rejected by guard", "error", err)
+		return toolError(fmt.Sprintf("query rejected: %v", err)), nil, nil
+	}
+
+	limit := guard.ClampLimit(in.Limit, s.cfg.MaxRows)
+	res, err := s.repo.ExecuteReadOnlyQuery(ctx, in.SQL, limit)
+	if err != nil {
+		s.logger.Warn("run_query failed", "error", err)
+		return toolError(fmt.Sprintf("query failed: %v", err)), nil, nil
+	}
+
+	if res.Columns == nil {
+		res.Columns = make([]string, 0)
+	}
+	if res.Rows == nil {
+		res.Rows = make([][]any, 0)
+	}
+	guard.RedactRows(res.Columns, res.Rows, s.cfg.RedactColumns)
+
+	s.logger.Debug("handled run_query", "row_count", res.RowCount, "truncated", res.Truncated, "execution_time_ms", res.ExecutionTimeMs)
+	return nil, res, nil
+}
+
+func (s *Server) handleExplainQuery(ctx context.Context, _ *mcp.CallToolRequest, in ExplainQueryInput) (*mcp.CallToolResult, *db.ExplainResult, error) {
+	if err := guard.ValidateReadOnlyQuery(in.SQL); err != nil {
+		s.logger.Warn("explain_query rejected by guard", "error", err)
+		return toolError(fmt.Sprintf("query rejected: %v", err)), nil, nil
+	}
+
+	res, err := s.repo.ExplainQuery(ctx, in.SQL, in.Analyze)
+	if err != nil {
+		s.logger.Warn("explain_query failed", "analyze", in.Analyze, "error", err)
+		return toolError(fmt.Sprintf("explain failed: %v", err)), nil, nil
+	}
+
+	s.logger.Debug("handled explain_query", "analyze", in.Analyze, "execution_time_ms", res.ExecutionTimeMs)
+	return nil, res, nil
 }
 
 // toolError returns an explicit MCP tool error result (IsError: true) so operational
