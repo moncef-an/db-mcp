@@ -6,6 +6,8 @@ import (
 	"log/slog"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/moncef-an/db-mcp/internal/config"
+	"github.com/moncef-an/db-mcp/internal/db"
 )
 
 const (
@@ -16,13 +18,20 @@ const (
 // Server wraps the MCP SDK server and coordinates tool registration and stdio transport.
 type Server struct {
 	mcpServer *mcp.Server
+	repo      db.Repository
+	cfg       *config.Config
 	logger    *slog.Logger
 }
 
 // NewServer constructs an MCP server and registers all active tools.
-func NewServer(logger *slog.Logger) *Server {
+func NewServer(repo db.Repository, cfg *config.Config, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if cfg == nil {
+		cfg = &config.Config{
+			MaxRows: config.DefaultMaxRows,
+		}
 	}
 
 	srv := mcp.NewServer(&mcp.Implementation{
@@ -32,6 +41,8 @@ func NewServer(logger *slog.Logger) *Server {
 
 	s := &Server{
 		mcpServer: srv,
+		repo:      repo,
+		cfg:       cfg,
 		logger:    logger,
 	}
 
