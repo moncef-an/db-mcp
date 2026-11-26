@@ -161,3 +161,30 @@ func TestConfig_LogValueRedactsDatabaseURL(t *testing.T) {
 		t.Fatalf("LogValue() missing [REDACTED] marker: %s", rendered)
 	}
 }
+
+func TestLoad_MalformedDatabaseURLDoesNotLeakCredentials(t *testing.T) {
+	_, err := Load(nil, envFromMap(map[string]string{
+		"DATABASE_URL": "postgres://admin:supersecret@db.internal:5432/prod\x00",
+	}))
+	if err == nil {
+		t.Fatal("Load() expected error for malformed DATABASE_URL, got nil")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "supersecret") || strings.Contains(msg, "admin") || strings.Contains(msg, "db.internal") {
+		t.Fatalf("Load() error leaked DATABASE_URL credentials: %q", msg)
+	}
+}
+
+func TestConfig_RedactSecrets(t *testing.T) {
+	cfg := &Config{
+		DatabaseURL: "postgres://admin:s3cr3tP@ss@db.internal:5432/prod?sslmode=require",
+	}
+	raw := "connect failed for postgres://admin:s3cr3tP@ss@db.internal:5432/prod?sslmode=require (password s3cr3tP@ss)"
+	sanitized := cfg.RedactSecrets(raw)
+	if strings.Contains(sanitized, "s3cr3tP@ss") || strings.Contains(sanitized, "db.internal") {
+		t.Fatalf("RedactSecrets() leaked secret or DSN: %q", sanitized)
+	}
+	if !strings.Contains(sanitized, "[REDACTED]") {
+		t.Fatalf("RedactSecrets() expected [REDACTED] marker: %q", sanitized)
+	}
+}

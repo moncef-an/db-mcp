@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/moncef-an/db-mcp/internal/config"
@@ -26,12 +27,16 @@ type Server struct {
 // NewServer constructs an MCP server and registers all active tools.
 func NewServer(repo db.Repository, cfg *config.Config, logger *slog.Logger) *Server {
 	if logger == nil {
-		logger = slog.Default()
+		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
-	if cfg == nil {
-		cfg = &config.Config{
-			MaxRows: config.DefaultMaxRows,
-		}
+	var normalizedCfg config.Config
+	if cfg != nil {
+		normalizedCfg = *cfg
+	}
+	if normalizedCfg.MaxRows <= 0 {
+		normalizedCfg.MaxRows = config.DefaultMaxRows
+	} else if normalizedCfg.MaxRows > config.HardMaxRows {
+		normalizedCfg.MaxRows = config.HardMaxRows
 	}
 
 	srv := mcp.NewServer(&mcp.Implementation{
@@ -42,7 +47,7 @@ func NewServer(repo db.Repository, cfg *config.Config, logger *slog.Logger) *Ser
 	s := &Server{
 		mcpServer: srv,
 		repo:      repo,
-		cfg:       cfg,
+		cfg:       &normalizedCfg,
 		logger:    logger,
 	}
 

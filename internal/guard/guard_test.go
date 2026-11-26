@@ -2,6 +2,7 @@ package guard
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -83,6 +84,47 @@ func TestValidateReadOnlyQuery(t *testing.T) {
 		{name: "unicode whitespace leading delete", sql: "\u00a0DELETE FROM users", wantErr: true},
 		{name: "unicode whitespace multi-statement injection", sql: "SELECT 1;\u2003DROP TABLE users", wantErr: true},
 		{name: "ideographic space multi-statement injection", sql: "SELECT 1;\u3000DELETE FROM users", wantErr: true},
+
+		// NUL bytes, CR line-comment termination, and size limits
+		{name: "nul byte in query", sql: "SELECT 1\x00", wantErr: true},
+		{name: "nul byte in literal", sql: "SELECT '\x00'", wantErr: true},
+		{name: "nul byte before semicolon", sql: "SELECT 1\x00; DROP TABLE users", wantErr: true},
+		{name: "carriage return terminates line comment", sql: "SELECT 1 -- comment\r; DROP TABLE users", wantErr: true},
+		{name: "query exceeds max length", sql: "SELECT '" + strings.Repeat("a", maxQueryBytes) + "'", wantErr: true},
+
+		// Non-SELECT/WITH PostgreSQL commands
+		{name: "values statement rejected", sql: "VALUES (1, 2)", wantErr: true},
+		{name: "table statement rejected", sql: "TABLE users", wantErr: true},
+		{name: "prepare statement rejected", sql: "PREPARE p AS SELECT 1", wantErr: true},
+		{name: "deallocate statement rejected", sql: "DEALLOCATE ALL", wantErr: true},
+		{name: "listen statement rejected", sql: "LISTEN events", wantErr: true},
+		{name: "notify statement rejected", sql: "NOTIFY events, 'hi'", wantErr: true},
+		{name: "discard statement rejected", sql: "DISCARD ALL", wantErr: true},
+		{name: "reset statement rejected", sql: "RESET ALL", wantErr: true},
+		{name: "vacuum statement rejected", sql: "VACUUM users", wantErr: true},
+		{name: "analyze statement rejected", sql: "ANALYZE users", wantErr: true},
+		{name: "cluster statement rejected", sql: "CLUSTER users", wantErr: true},
+		{name: "reindex statement rejected", sql: "REINDEX TABLE users", wantErr: true},
+		{name: "refresh materialized view rejected", sql: "REFRESH MATERIALIZED VIEW mv_users", wantErr: true},
+		{name: "security label rejected", sql: "SECURITY LABEL ON TABLE users IS 'secret'", wantErr: true},
+
+		// Dangerous PostgreSQL built-in functions (unquoted, schema-qualified, double-quoted)
+		{name: "set_config rejected", sql: "SELECT set_config('statement_timeout', '0', false)", wantErr: true},
+		{name: "double quoted set_config rejected", sql: `SELECT "set_config"('statement_timeout', '0', false)`, wantErr: true},
+		{name: "schema qualified set_config rejected", sql: "SELECT pg_catalog.set_config('statement_timeout', '0', false)", wantErr: true},
+		{name: "pg_read_file rejected", sql: "SELECT pg_read_file('/etc/passwd')", wantErr: true},
+		{name: "double quoted pg_read_file rejected", sql: `SELECT "pg_read_file"('/etc/passwd')`, wantErr: true},
+		{name: "pg_read_binary_file rejected", sql: "SELECT pg_read_binary_file('/etc/passwd')", wantErr: true},
+		{name: "pg_ls_dir rejected", sql: "SELECT pg_ls_dir('/etc')", wantErr: true},
+		{name: "pg_stat_file rejected", sql: "SELECT pg_stat_file('/etc/passwd')", wantErr: true},
+		{name: "lo_import rejected", sql: "SELECT lo_import('/etc/passwd')", wantErr: true},
+		{name: "lo_export rejected", sql: "SELECT lo_export(1234, '/tmp/out')", wantErr: true},
+		{name: "pg_terminate_backend rejected", sql: "SELECT pg_terminate_backend(1234)", wantErr: true},
+		{name: "pg_cancel_backend rejected", sql: "SELECT pg_cancel_backend(1234)", wantErr: true},
+		{name: "pg_reload_conf rejected", sql: "SELECT pg_reload_conf()", wantErr: true},
+		{name: "dblink rejected", sql: "SELECT * FROM dblink('host=127.0.0.1', 'DELETE FROM users') AS t(x int)", wantErr: true},
+		{name: "dblink_exec rejected", sql: "SELECT dblink_exec('host=127.0.0.1', 'DELETE FROM users')", wantErr: true},
+		{name: "dangerous function in CTE rejected", sql: "WITH x AS (SELECT pg_read_file('/etc/passwd') AS f) SELECT * FROM x", wantErr: true},
 	}
 
 	for _, tc := range tests {
@@ -135,4 +177,40 @@ func TestRedactRows(t *testing.T) {
 	if !reflect.DeepEqual(rows, want) {
 		t.Fatalf("RedactRows() = %#v, want %#v", rows, want)
 	}
+}
+
+func TestRedactRowsEdgeCases(t *testing.T) {
+	t.Run("case-insensitive pattern and whitespace trimming", func(t *testing.T) {
+		columns := []string{"id", "SECRET_TOKEN", "email"}
+		rows := [][]any{{1, "tok-123", "a@b.com"}}
+		RedactRows(columns, rows, []string{"  TOKEN  ", "", "   "})
+		want := [][]any{{1, "[REDACTED]", "a@b.com"}}
+		if !reflect.DeepEqual(rows, want) {
+			t.Fatalf("got %#v, want %#v", rows, want)
+		}
+	})
+
+	t.Run("slice safety with nil, short, and long rows", func(t *testing.T) {
+		columns := []string{"id", "password"}
+		rows := [][]any{
+			nil,
+			{1},
+			{2, "secret", "extra"},
+		}
+		RedactRows(columns, rows, []string{"password"})
+		want := [][]any{
+			nil,
+			{1},
+			{2, "[REDACTED]", "extra"},
+		}
+		if !reflect.DeepEqual(rows, want) {
+			t.Fatalf("got %#v, want %#v", rows, want)
+		}
+	})
+
+	t.Run("empty inputs do not panic", func(t *testing.T) {
+		RedactRows(nil, nil, nil)
+		RedactRows([]string{"password"}, nil, []string{"password"})
+		RedactRows(nil, [][]any{{"x"}}, []string{"password"})
+	})
 }
