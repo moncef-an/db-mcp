@@ -1,0 +1,31 @@
+version: 2
+
+project_name: db-mcp
+
+builds:
+  - id: db-mcp
+    main: ./cmd/db-mcp
+    binary: db-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: checksums.txt
