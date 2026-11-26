@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/moncef-an/db-mcp/internal/config"
+	"github.com/moncef-an/db-mcp/internal/db/postgres"
 	"github.com/moncef-an/db-mcp/internal/mcp"
 )
 
@@ -34,6 +35,18 @@ func run(args []string, getenv func(string) string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	repo, err := postgres.New(ctx, cfg.DatabaseURL, cfg.QueryTimeout, logger)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := repo.Close(); closeErr != nil {
+			logger.Warn("failed to close database pool", "error", closeErr)
+		}
+	}()
+
+	logger.Info("connected to postgresql")
 
 	srv := mcp.NewServer(logger)
 	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
