@@ -48,7 +48,7 @@ func run(args []string, getenv func(string) string) error {
 
 	logger.Info("connected to postgresql")
 
-	srv := mcp.NewServer(logger)
+	srv := mcp.NewServer(repo, cfg, logger)
 	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
