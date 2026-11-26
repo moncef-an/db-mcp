@@ -4,14 +4,31 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/moncef-an/db-mcp/internal/db"
+)
+
+const (
+	defaultQueryTimeout = 5 * time.Second
+	maxQueryTimeout     = 30 * time.Second
+	maxAllowedRows      = 1000
+	maxResultBytes      = 10 * 1024 * 1024 // 10 MiB
+	maxExplainBytes     = 10 * 1024 * 1024 // 10 MiB
+)
+
+var (
+	dsnURLPattern      = regexp.MustCompile(`(?i)postgres(?:ql)?://[^\s'"]+`)
+	dsnPasswordPattern = regexp.MustCompile(`(?i)\bpassword\s*=\s*(?:'[^']*'|\S+)`)
 )
 
 var _ db.Repository = (*Repository)(nil)
@@ -29,17 +46,22 @@ func New(ctx context.Context, dsn string, queryTimeout time.Duration, logger *sl
 		logger = slog.Default()
 	}
 	if queryTimeout <= 0 {
-		queryTimeout = 5 * time.Second
+		queryTimeout = defaultQueryTimeout
+	} else if queryTimeout > maxQueryTimeout {
+		queryTimeout = maxQueryTimeout
 	}
 
-	sqlDB, err := sql.Open("pgx", dsn)
+	connConfig, err := parseSecureConfig(dsn, queryTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("open postgres pool: %w", err)
+		return nil, err
 	}
+
+	sqlDB := stdlib.OpenDB(*connConfig)
 
 	sqlDB.SetMaxOpenConns(10)
 	sqlDB.SetMaxIdleConns(5)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 
 	repo := &Repository{
 		db:           sqlDB,
@@ -55,13 +77,37 @@ func New(ctx context.Context, dsn string, queryTimeout time.Duration, logger *sl
 	return repo, nil
 }
 
+// parseSecureConfig parses dsn without leaking credentials on error, forbids simple_protocol
+// multi-statement execution, and enforces session-level read-only and timeout defaults.
+func parseSecureConfig(dsn string, queryTimeout time.Duration) (*pgx.ConnConfig, error) {
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("invalid postgres connection string")
+	}
+
+	// Never allow SimpleQuery protocol, which permits multi-statement strings (e.g., COMMIT; BEGIN READ WRITE; ...).
+	if connConfig.DefaultQueryExecMode == pgx.QueryExecModeSimpleProtocol {
+		connConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	}
+
+	if connConfig.RuntimeParams == nil {
+		connConfig.RuntimeParams = make(map[string]string)
+	}
+	timeoutMs := strconv.FormatInt(queryTimeout.Milliseconds(), 10)
+	connConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	connConfig.RuntimeParams["statement_timeout"] = timeoutMs
+	connConfig.RuntimeParams["lock_timeout"] = timeoutMs
+
+	return connConfig, nil
+}
+
 // Ping verifies database reachability within queryTimeout.
 func (r *Repository) Ping(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
 	defer cancel()
 
 	if err := r.db.PingContext(ctx); err != nil {
-		return fmt.Errorf("postgres ping: %w", err)
+		return fmt.Errorf("postgres ping: %s", redactCredentials(err.Error()))
 	}
 	return nil
 }
@@ -91,10 +137,15 @@ func (r *Repository) withReadOnlyTx(ctx context.Context, fn func(ctx context.Con
 	return fn(ctx, tx)
 }
 
-// ExecuteReadOnlyQuery runs a query inside a read-only transaction and caps results at maxRows.
+// ExecuteReadOnlyQuery runs a query inside a read-only transaction and caps results at maxRows and maxResultBytes.
 func (r *Repository) ExecuteReadOnlyQuery(ctx context.Context, query string, maxRows int) (*db.QueryResult, error) {
+	if err := validateQueryInput(query); err != nil {
+		return nil, err
+	}
 	if maxRows <= 0 {
 		maxRows = 1
+	} else if maxRows > maxAllowedRows {
+		maxRows = maxAllowedRows
 	}
 
 	start := time.Now()
@@ -117,6 +168,7 @@ func (r *Repository) ExecuteReadOnlyQuery(ctx context.Context, query string, max
 		}
 
 		resultRows = make([][]any, 0)
+		totalBytes := 0
 		for rows.Next() {
 			if len(resultRows) == maxRows {
 				truncated = true
@@ -133,7 +185,12 @@ func (r *Repository) ExecuteReadOnlyQuery(ctx context.Context, query string, max
 			}
 
 			for i, v := range vals {
-				vals[i] = normalizeValue(v)
+				norm := normalizeValue(v)
+				vals[i] = norm
+				totalBytes += estimateValueBytes(norm)
+				if totalBytes > maxResultBytes {
+					return fmt.Errorf("query result exceeds maximum allowed size (%d bytes)", maxResultBytes)
+				}
 			}
 			resultRows = append(resultRows, vals)
 		}
@@ -379,6 +436,13 @@ func (r *Repository) DescribeTable(ctx context.Context, schema, table string) (*
 // ExplainQuery runs EXPLAIN (FORMAT JSON) or EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
 // inside a rolled-back read-only transaction.
 func (r *Repository) ExplainQuery(ctx context.Context, query string, analyze bool) (*db.ExplainResult, error) {
+	if err := validateQueryInput(query); err != nil {
+		return nil, err
+	}
+	if hasLeadingExplain(query) {
+		return nil, errors.New("explain query must not include a leading EXPLAIN keyword")
+	}
+
 	prefix := "EXPLAIN (FORMAT JSON) "
 	if analyze {
 		prefix = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
@@ -391,6 +455,9 @@ func (r *Repository) ExplainQuery(ctx context.Context, query string, analyze boo
 		if err := tx.QueryRowContext(txCtx, prefix+query).Scan(&rawPlan); err != nil {
 			return fmt.Errorf("explain query: %w", err)
 		}
+		if len(rawPlan) > maxExplainBytes {
+			return fmt.Errorf("explain plan exceeds maximum allowed size (%d bytes)", maxExplainBytes)
+		}
 		return nil
 	})
 	if err != nil {
@@ -401,6 +468,50 @@ func (r *Repository) ExplainQuery(ctx context.Context, query string, analyze boo
 		Plan:            json.RawMessage(rawPlan),
 		ExecutionTimeMs: time.Since(start).Milliseconds(),
 	}, nil
+}
+
+func validateQueryInput(query string) error {
+	if strings.TrimSpace(query) == "" {
+		return errors.New("query must not be empty")
+	}
+	if strings.ContainsRune(query, '\x00') {
+		return errors.New("query must not contain NUL bytes")
+	}
+	return nil
+}
+
+func hasLeadingExplain(query string) bool {
+	trimmed := strings.TrimSpace(query)
+	if len(trimmed) < len("EXPLAIN") {
+		return false
+	}
+	if !strings.EqualFold(trimmed[:len("EXPLAIN")], "EXPLAIN") {
+		return false
+	}
+	if len(trimmed) == len("EXPLAIN") {
+		return true
+	}
+	next := trimmed[len("EXPLAIN")]
+	return next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == '('
+}
+
+func redactCredentials(msg string) string {
+	msg = dsnURLPattern.ReplaceAllString(msg, "[REDACTED_DSN]")
+	msg = dsnPasswordPattern.ReplaceAllString(msg, "password=[REDACTED]")
+	return msg
+}
+
+func estimateValueBytes(v any) int {
+	switch val := v.(type) {
+	case nil:
+		return 4
+	case string:
+		return len(val)
+	case []byte:
+		return len(val)
+	default:
+		return 32
+	}
 }
 
 // normalizeValue converts database/sql scanned values into JSON-friendly primitives.

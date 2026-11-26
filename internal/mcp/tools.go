@@ -11,6 +11,8 @@ import (
 	"github.com/moncef-an/db-mcp/internal/guard"
 )
 
+const maxSQLLength = 64 * 1024
+
 // ListTablesInput defines the input schema for list_tables.
 type ListTablesInput struct {
 	Schema string `json:"schema,omitempty" jsonschema:"PostgreSQL schema name (defaults to public)"`
@@ -70,8 +72,9 @@ func (s *Server) handleListTables(ctx context.Context, _ *mcp.CallToolRequest, i
 
 	tables, err := s.repo.ListTables(ctx, schema)
 	if err != nil {
-		s.logger.Warn("list_tables failed", "schema", schema, "error", err)
-		return toolError(fmt.Sprintf("failed to list tables in schema %q: %v", schema, err)), ListTablesOutput{}, nil
+		safeErr := s.cfg.RedactSecrets(err.Error())
+		s.logger.Warn("list_tables failed", "schema", schema, "error", safeErr)
+		return toolError(fmt.Sprintf("failed to list tables in schema %q: %s", schema, safeErr)), ListTablesOutput{}, nil
 	}
 	if tables == nil {
 		tables = make([]db.TableSummary, 0)
@@ -100,8 +103,9 @@ func (s *Server) handleDescribeTable(ctx context.Context, _ *mcp.CallToolRequest
 		if errors.Is(err, db.ErrTableNotFound) {
 			return toolError(fmt.Sprintf("table %q not found in schema %q", table, schema)), nil, nil
 		}
-		s.logger.Warn("describe_table failed", "schema", schema, "table", table, "error", err)
-		return toolError(fmt.Sprintf("failed to describe table %q.%q: %v", schema, table, err)), nil, nil
+		safeErr := s.cfg.RedactSecrets(err.Error())
+		s.logger.Warn("describe_table failed", "schema", schema, "table", table, "error", safeErr)
+		return toolError(fmt.Sprintf("failed to describe table %q.%q: %s", schema, table, safeErr)), nil, nil
 	}
 
 	s.logger.Debug("handled describe_table", "schema", schema, "table", table)
@@ -109,6 +113,11 @@ func (s *Server) handleDescribeTable(ctx context.Context, _ *mcp.CallToolRequest
 }
 
 func (s *Server) handleRunQuery(ctx context.Context, _ *mcp.CallToolRequest, in RunQueryInput) (*mcp.CallToolResult, *db.QueryResult, error) {
+	if len(in.SQL) > maxSQLLength {
+		s.logger.Warn("run_query rejected: sql exceeds max length", "length", len(in.SQL), "max_length", maxSQLLength)
+		return toolError(fmt.Sprintf("query rejected: SQL length %d exceeds maximum allowed %d bytes", len(in.SQL), maxSQLLength)), nil, nil
+	}
+
 	if err := guard.ValidateReadOnlyQuery(in.SQL); err != nil {
 		s.logger.Warn("run_query rejected by guard", "error", err)
 		return toolError(fmt.Sprintf("query rejected: %v", err)), nil, nil
@@ -117,8 +126,9 @@ func (s *Server) handleRunQuery(ctx context.Context, _ *mcp.CallToolRequest, in 
 	limit := guard.ClampLimit(in.Limit, s.cfg.MaxRows)
 	res, err := s.repo.ExecuteReadOnlyQuery(ctx, in.SQL, limit)
 	if err != nil {
-		s.logger.Warn("run_query failed", "error", err)
-		return toolError(fmt.Sprintf("query failed: %v", err)), nil, nil
+		safeErr := s.cfg.RedactSecrets(err.Error())
+		s.logger.Warn("run_query failed", "error", safeErr)
+		return toolError(fmt.Sprintf("query failed: %s", safeErr)), nil, nil
 	}
 
 	if res.Columns == nil {
@@ -134,6 +144,11 @@ func (s *Server) handleRunQuery(ctx context.Context, _ *mcp.CallToolRequest, in 
 }
 
 func (s *Server) handleExplainQuery(ctx context.Context, _ *mcp.CallToolRequest, in ExplainQueryInput) (*mcp.CallToolResult, *db.ExplainResult, error) {
+	if len(in.SQL) > maxSQLLength {
+		s.logger.Warn("explain_query rejected: sql exceeds max length", "length", len(in.SQL), "max_length", maxSQLLength)
+		return toolError(fmt.Sprintf("query rejected: SQL length %d exceeds maximum allowed %d bytes", len(in.SQL), maxSQLLength)), nil, nil
+	}
+
 	if err := guard.ValidateReadOnlyQuery(in.SQL); err != nil {
 		s.logger.Warn("explain_query rejected by guard", "error", err)
 		return toolError(fmt.Sprintf("query rejected: %v", err)), nil, nil
@@ -141,8 +156,9 @@ func (s *Server) handleExplainQuery(ctx context.Context, _ *mcp.CallToolRequest,
 
 	res, err := s.repo.ExplainQuery(ctx, in.SQL, in.Analyze)
 	if err != nil {
-		s.logger.Warn("explain_query failed", "analyze", in.Analyze, "error", err)
-		return toolError(fmt.Sprintf("explain failed: %v", err)), nil, nil
+		safeErr := s.cfg.RedactSecrets(err.Error())
+		s.logger.Warn("explain_query failed", "analyze", in.Analyze, "error", safeErr)
+		return toolError(fmt.Sprintf("explain failed: %s", safeErr)), nil, nil
 	}
 
 	s.logger.Debug("handled explain_query", "analyze", in.Analyze, "execution_time_ms", res.ExecutionTimeMs)

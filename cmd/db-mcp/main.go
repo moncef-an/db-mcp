@@ -38,11 +38,11 @@ func run(args []string, getenv func(string) string) error {
 
 	repo, err := postgres.New(ctx, cfg.DatabaseURL, cfg.QueryTimeout, logger)
 	if err != nil {
-		return err
+		return errors.New(cfg.RedactSecrets(err.Error()))
 	}
 	defer func() {
 		if closeErr := repo.Close(); closeErr != nil {
-			logger.Warn("failed to close database pool", "error", closeErr)
+			logger.Warn("failed to close database pool", "error", cfg.RedactSecrets(closeErr.Error()))
 		}
 	}()
 
@@ -50,7 +50,7 @@ func run(args []string, getenv func(string) string) error {
 
 	srv := mcp.NewServer(repo, cfg, logger)
 	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+		return errors.New(cfg.RedactSecrets(err.Error()))
 	}
 
 	logger.Info("db-mcp shutdown complete")

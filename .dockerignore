@@ -1,0 +1,7 @@
+.git
+bin/
+.env*
+SPEC.md
+AGENTS.md
+.agent/
+.github/

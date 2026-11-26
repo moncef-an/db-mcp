@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/moncef-an/db-mcp/internal/config"
 	"github.com/moncef-an/db-mcp/internal/db"
 )
@@ -311,4 +314,115 @@ func TestHandleExplainQuery(t *testing.T) {
 			t.Errorf("Plan = %s, want %s", string(out.Plan), string(wantPlan))
 		}
 	})
+}
+
+func TestHandleQuery_MaxSQLLengthDoS(t *testing.T) {
+	hugeSQL := "SELECT /* " + strings.Repeat("a", maxSQLLength) + " */ 1"
+
+	t.Run("run_query rejects oversized SQL before repo", func(t *testing.T) {
+		called := false
+		srv := NewServer(&mockRepo{
+			executeReadOnlyQueryFn: func(context.Context, string, int) (*db.QueryResult, error) {
+				called = true
+				return nil, nil
+			},
+		}, &config.Config{MaxRows: 100}, nil)
+
+		res, _, err := srv.handleRunQuery(context.Background(), nil, RunQueryInput{SQL: hugeSQL})
+		if err != nil {
+			t.Fatalf("unexpected Go error: %v", err)
+		}
+		if called {
+			t.Fatal("expected oversized SQL to be rejected before calling repo")
+		}
+		if res == nil || !res.IsError {
+			t.Fatalf("expected IsError=true, got %+v", res)
+		}
+	})
+
+	t.Run("explain_query rejects oversized SQL before repo", func(t *testing.T) {
+		called := false
+		srv := NewServer(&mockRepo{
+			explainQueryFn: func(context.Context, string, bool) (*db.ExplainResult, error) {
+				called = true
+				return nil, nil
+			},
+		}, &config.Config{MaxRows: 100}, nil)
+
+		res, _, err := srv.handleExplainQuery(context.Background(), nil, ExplainQueryInput{SQL: hugeSQL})
+		if err != nil {
+			t.Fatalf("unexpected Go error: %v", err)
+		}
+		if called {
+			t.Fatal("expected oversized SQL to be rejected before calling repo")
+		}
+		if res == nil || !res.IsError {
+			t.Fatalf("expected IsError=true, got %+v", res)
+		}
+	})
+}
+
+func TestHandleRunQuery_LimitClampingEdgeCases(t *testing.T) {
+	tests := []struct {
+		name         string
+		cfgMaxRows   int
+		requestLimit int
+		wantMaxRows  int
+	}{
+		{name: "negative limit defaults to cfg.MaxRows", cfgMaxRows: 100, requestLimit: -1, wantMaxRows: 100},
+		{name: "zero limit defaults to cfg.MaxRows", cfgMaxRows: 100, requestLimit: 0, wantMaxRows: 100},
+		{name: "math.MaxInt limit clamps to cfg.MaxRows", cfgMaxRows: 100, requestLimit: math.MaxInt, wantMaxRows: 100},
+		{name: "unvalidated cfg.MaxRows=math.MaxInt clamps to HardMaxRows", cfgMaxRows: math.MaxInt, requestLimit: math.MaxInt, wantMaxRows: config.HardMaxRows},
+		{name: "unvalidated cfg.MaxRows=0 defaults to DefaultMaxRows", cfgMaxRows: 0, requestLimit: 0, wantMaxRows: config.DefaultMaxRows},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMaxRows int
+			srv := NewServer(&mockRepo{
+				executeReadOnlyQueryFn: func(_ context.Context, _ string, maxRows int) (*db.QueryResult, error) {
+					gotMaxRows = maxRows
+					return &db.QueryResult{Columns: []string{"ok"}, Rows: [][]any{{1}}, RowCount: 1}, nil
+				},
+			}, &config.Config{MaxRows: tc.cfgMaxRows}, nil)
+
+			res, _, err := srv.handleRunQuery(context.Background(), nil, RunQueryInput{
+				SQL:   "SELECT 1",
+				Limit: tc.requestLimit,
+			})
+			if err != nil {
+				t.Fatalf("unexpected Go error: %v", err)
+			}
+			if res != nil && res.IsError {
+				t.Fatalf("expected IsError=false, got %+v", res)
+			}
+			if gotMaxRows != tc.wantMaxRows {
+				t.Errorf("gotMaxRows = %d, want %d", gotMaxRows, tc.wantMaxRows)
+			}
+		})
+	}
+}
+
+func TestToolErrors_RedactDatabaseURLAndPassword(t *testing.T) {
+	dsn := "postgres://dbuser:topsecret123@db.internal:5432/prod"
+	srv := NewServer(&mockRepo{
+		listTablesFn: func(context.Context, string) ([]db.TableSummary, error) {
+			return nil, fmt.Errorf("dial %s: password topsecret123 rejected", dsn)
+		},
+	}, &config.Config{DatabaseURL: dsn, MaxRows: 100}, nil)
+
+	res, _, err := srv.handleListTables(context.Background(), nil, ListTablesInput{})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res == nil || !res.IsError || len(res.Content) == 0 {
+		t.Fatalf("expected IsError=true with content, got %+v", res)
+	}
+	tc, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected *mcp.TextContent, got %T", res.Content[0])
+	}
+	if strings.Contains(tc.Text, "topsecret123") || strings.Contains(tc.Text, "db.internal") {
+		t.Fatalf("toolError leaked DSN or password: %q", tc.Text)
+	}
 }

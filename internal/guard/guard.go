@@ -8,7 +8,10 @@ import (
 	"unicode/utf8"
 )
 
-const redactedValue = "[REDACTED]"
+const (
+	redactedValue = "[REDACTED]"
+	maxQueryBytes = 64 * 1024
+)
 
 var blockedKeywords = map[string]struct{}{
 	"INSERT":   {},
@@ -30,9 +33,37 @@ var blockedKeywords = map[string]struct{}{
 	"MERGE":    {},
 }
 
+var blockedFunctions = map[string]struct{}{
+	"SET_CONFIG":           {},
+	"PG_READ_FILE":         {},
+	"PG_READ_BINARY_FILE":  {},
+	"PG_LS_DIR":            {},
+	"PG_STAT_FILE":         {},
+	"LO_IMPORT":            {},
+	"LO_EXPORT":            {},
+	"LO_UNLINK":            {},
+	"PG_TERMINATE_BACKEND": {},
+	"PG_CANCEL_BACKEND":    {},
+	"PG_RELOAD_CONF":       {},
+	"PG_ROTATE_LOGFILE":    {},
+	"DBLINK":               {},
+	"DBLINK_EXEC":          {},
+	"DBLINK_CONNECT":       {},
+	"DBLINK_CONNECT_U":     {},
+	"DBLINK_SEND_QUERY":    {},
+	"DBLINK_GET_RESULTS":   {},
+}
+
 // ValidateReadOnlyQuery ensures sql is a single, non-empty SELECT or WITH statement
-// containing no mutating keywords outside string literals or quoted identifiers.
+// containing no mutating keywords or dangerous functions outside string literals.
 func ValidateReadOnlyQuery(sql string) error {
+	if len(sql) > maxQueryBytes {
+		return fmt.Errorf("query exceeds maximum allowed length of %d bytes", maxQueryBytes)
+	}
+	if strings.IndexByte(sql, 0) >= 0 {
+		return errors.New("NUL bytes are not allowed in query")
+	}
+
 	s := &sqlScanner{src: sql}
 	var firstWord string
 	var prevPrevWord, prevWord string
@@ -63,8 +94,12 @@ func ValidateReadOnlyQuery(sql string) error {
 			}
 		case r == '"':
 			prevPrevWord, prevWord = "", ""
-			if err := s.skipDoubleQuoted(); err != nil {
+			ident, err := s.readDoubleQuoted()
+			if err != nil {
 				return err
+			}
+			if _, blocked := blockedFunctions[strings.ToUpper(ident)]; blocked {
+				return fmt.Errorf("privileged or dangerous function %q is not allowed", ident)
 			}
 		case r == '$':
 			prevPrevWord, prevWord = "", ""
@@ -85,6 +120,9 @@ func ValidateReadOnlyQuery(sql string) error {
 			}
 			if _, blocked := blockedKeywords[word]; blocked {
 				return fmt.Errorf("mutating or privileged keyword %q is not allowed", word)
+			}
+			if _, blocked := blockedFunctions[word]; blocked {
+				return fmt.Errorf("privileged or dangerous function %q is not allowed", word)
 			}
 			if (prevWord == "FOR" && word == "SHARE") || (prevPrevWord == "FOR" && prevWord == "KEY" && word == "SHARE") {
 				return errors.New("locking clause FOR SHARE / FOR KEY SHARE is not allowed")
@@ -133,8 +171,9 @@ func RedactRows(columns []string, rows [][]any, patterns []string) {
 	anyMatched := false
 	for i, col := range columns {
 		lower := strings.ToLower(col)
-		for _, pat := range patterns {
-			if pat != "" && strings.Contains(lower, strings.ToLower(pat)) {
+		for _, rawPat := range patterns {
+			pat := strings.ToLower(strings.TrimSpace(rawPat))
+			if pat != "" && strings.Contains(lower, pat) {
 				redactCol[i] = true
 				anyMatched = true
 				break
@@ -168,7 +207,7 @@ func (s *sqlScanner) skipSpaceAndComments() error {
 		}
 		if strings.HasPrefix(s.src[s.pos:], "--") {
 			s.pos += 2
-			for s.pos < len(s.src) && s.src[s.pos] != '\n' {
+			for s.pos < len(s.src) && s.src[s.pos] != '\n' && s.src[s.pos] != '\r' {
 				s.pos++
 			}
 			continue
@@ -248,20 +287,23 @@ func (s *sqlScanner) skipEscapeSingleQuoted() error {
 	return errors.New("unterminated string literal")
 }
 
-func (s *sqlScanner) skipDoubleQuoted() error {
+func (s *sqlScanner) readDoubleQuoted() (string, error) {
 	s.pos++ // opening "
+	var b strings.Builder
 	for s.pos < len(s.src) {
 		if s.src[s.pos] == '"' {
 			s.pos++
 			if s.pos < len(s.src) && s.src[s.pos] == '"' {
+				b.WriteByte('"')
 				s.pos++ // escaped ""
 				continue
 			}
-			return nil
+			return b.String(), nil
 		}
+		b.WriteByte(s.src[s.pos])
 		s.pos++
 	}
-	return errors.New("unterminated quoted identifier")
+	return "", errors.New("unterminated quoted identifier")
 }
 
 func (s *sqlScanner) matchDollarTag() (string, bool) {

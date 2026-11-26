@@ -146,13 +146,32 @@ func lookupEnv(getenv func(string) string, key string) (string, bool) {
 	return v, v != ""
 }
 
+// RedactSecrets scrubs DatabaseURL and any embedded password from s so error
+// messages logged to stderr or returned to MCP clients never leak credentials.
+func (c *Config) RedactSecrets(s string) string {
+	if c == nil || c.DatabaseURL == "" || s == "" {
+		return s
+	}
+	out := strings.ReplaceAll(s, c.DatabaseURL, "[REDACTED]")
+	if u, err := url.Parse(c.DatabaseURL); err == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			out = strings.ReplaceAll(out, pw, "[REDACTED]")
+		}
+	}
+	return out
+}
+
 func validateDatabaseURL(raw string) error {
 	if raw == "" {
 		return errors.New("DATABASE_URL (or --database-url) is required")
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("invalid DATABASE_URL: %w", err)
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return fmt.Errorf("invalid DATABASE_URL: %v", urlErr.Err)
+		}
+		return errors.New("invalid DATABASE_URL: malformed URL")
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "postgres" && scheme != "postgresql" {
