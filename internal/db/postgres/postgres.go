@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -156,14 +157,224 @@ func (r *Repository) ExecuteReadOnlyQuery(ctx context.Context, query string, max
 	}, nil
 }
 
-// ListTables will be implemented in Phase 3.
-func (r *Repository) ListTables(_ context.Context, _ string) ([]db.TableSummary, error) {
-	return nil, errors.New("list_tables not implemented")
+// ListTables lists all base tables and views in schema with estimated row counts.
+func (r *Repository) ListTables(ctx context.Context, schema string) ([]db.TableSummary, error) {
+	if schema == "" {
+		schema = "public"
+	}
+
+	const query = `
+		SELECT
+			t.table_name,
+			t.table_type,
+			COALESCE(GREATEST(c.reltuples, 0)::bigint, 0) AS estimated_rows
+		FROM information_schema.tables t
+		LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = t.table_schema
+		LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
+		WHERE t.table_schema = $1
+		  AND t.table_type IN ('BASE TABLE', 'VIEW')
+		ORDER BY t.table_name`
+
+	tables := make([]db.TableSummary, 0)
+	err := r.withReadOnlyTx(ctx, func(txCtx context.Context, tx *sql.Tx) error {
+		rows, err := tx.QueryContext(txCtx, query, schema)
+		if err != nil {
+			return fmt.Errorf("list tables in schema %q: %w", schema, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var ts db.TableSummary
+			if err := rows.Scan(&ts.Name, &ts.Type, &ts.EstimatedRows); err != nil {
+				return fmt.Errorf("scan table summary: %w", err)
+			}
+			tables = append(tables, ts)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate table summaries: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return tables, nil
 }
 
-// DescribeTable will be implemented in Phase 3.
-func (r *Repository) DescribeTable(_ context.Context, _, _ string) (*db.TableSchema, error) {
-	return nil, errors.New("describe_table not implemented")
+// DescribeTable returns columns, primary keys, foreign keys, and indexes for schema.table.
+func (r *Repository) DescribeTable(ctx context.Context, schema, table string) (*db.TableSchema, error) {
+	if schema == "" {
+		schema = "public"
+	}
+
+	result := &db.TableSchema{
+		Schema:      schema,
+		Table:       table,
+		Columns:     make([]db.ColumnInfo, 0),
+		PrimaryKeys: make([]string, 0),
+		ForeignKeys: make([]db.ForeignKeyInfo, 0),
+		Indexes:     make([]db.IndexInfo, 0),
+	}
+
+	err := r.withReadOnlyTx(ctx, func(txCtx context.Context, tx *sql.Tx) error {
+		var exists bool
+		const existsQuery = `
+			SELECT EXISTS (
+				SELECT 1
+				FROM information_schema.tables
+				WHERE table_schema = $1
+				  AND table_name = $2
+			)`
+		if err := tx.QueryRowContext(txCtx, existsQuery, schema, table).Scan(&exists); err != nil {
+			return fmt.Errorf("check table existence: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf("%w: %s.%s", db.ErrTableNotFound, schema, table)
+		}
+
+		const colsQuery = `
+			SELECT
+				column_name,
+				data_type,
+				(is_nullable = 'YES') AS nullable,
+				column_default
+			FROM information_schema.columns
+			WHERE table_schema = $1
+			  AND table_name = $2
+			ORDER BY ordinal_position`
+		colRows, err := tx.QueryContext(txCtx, colsQuery, schema, table)
+		if err != nil {
+			return fmt.Errorf("query columns: %w", err)
+		}
+		defer colRows.Close()
+
+		for colRows.Next() {
+			var col db.ColumnInfo
+			var def sql.NullString
+			if err := colRows.Scan(&col.Name, &col.DataType, &col.Nullable, &def); err != nil {
+				return fmt.Errorf("scan column: %w", err)
+			}
+			if def.Valid {
+				v := def.String
+				col.Default = &v
+			}
+			result.Columns = append(result.Columns, col)
+		}
+		if err := colRows.Err(); err != nil {
+			return fmt.Errorf("iterate columns: %w", err)
+		}
+
+		const pkQuery = `
+			SELECT a.attname
+			FROM pg_catalog.pg_index i
+			JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+			WHERE n.nspname = $1
+			  AND c.relname = $2
+			  AND i.indisprimary
+			ORDER BY array_position(i.indkey, a.attnum)`
+		pkRows, err := tx.QueryContext(txCtx, pkQuery, schema, table)
+		if err != nil {
+			return fmt.Errorf("query primary keys: %w", err)
+		}
+		defer pkRows.Close()
+
+		for pkRows.Next() {
+			var pk string
+			if err := pkRows.Scan(&pk); err != nil {
+				return fmt.Errorf("scan primary key: %w", err)
+			}
+			result.PrimaryKeys = append(result.PrimaryKeys, pk)
+		}
+		if err := pkRows.Err(); err != nil {
+			return fmt.Errorf("iterate primary keys: %w", err)
+		}
+
+		const fkQuery = `
+			SELECT
+				a.attname AS column_name,
+				fc.relname AS ref_table,
+				fa.attname AS ref_column,
+				con.conname AS constraint_name
+			FROM pg_catalog.pg_constraint con
+			JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
+			CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord)
+			JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+			JOIN pg_catalog.pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = k.fattnum
+			WHERE n.nspname = $1
+			  AND c.relname = $2
+			  AND con.contype = 'f'
+			ORDER BY con.conname, k.ord`
+		fkRows, err := tx.QueryContext(txCtx, fkQuery, schema, table)
+		if err != nil {
+			return fmt.Errorf("query foreign keys: %w", err)
+		}
+		defer fkRows.Close()
+
+		for fkRows.Next() {
+			var fk db.ForeignKeyInfo
+			if err := fkRows.Scan(&fk.Column, &fk.RefTable, &fk.RefColumn, &fk.ConstraintName); err != nil {
+				return fmt.Errorf("scan foreign key: %w", err)
+			}
+			result.ForeignKeys = append(result.ForeignKeys, fk)
+		}
+		if err := fkRows.Err(); err != nil {
+			return fmt.Errorf("iterate foreign keys: %w", err)
+		}
+
+		const idxQuery = `
+			SELECT
+				ic.relname AS index_name,
+				i.indisunique AS is_unique,
+				pg_catalog.pg_get_indexdef(ic.oid) AS definition,
+				COALESCE(
+					(
+						SELECT string_agg(a.attname, ',' ORDER BY k.ord)
+						FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+						JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+						WHERE k.attnum > 0
+					),
+					''
+				) AS columns_csv
+			FROM pg_catalog.pg_index i
+			JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+			WHERE n.nspname = $1
+			  AND c.relname = $2
+			ORDER BY ic.relname`
+		idxRows, err := tx.QueryContext(txCtx, idxQuery, schema, table)
+		if err != nil {
+			return fmt.Errorf("query indexes: %w", err)
+		}
+		defer idxRows.Close()
+
+		for idxRows.Next() {
+			var idx db.IndexInfo
+			var colsCSV string
+			if err := idxRows.Scan(&idx.Name, &idx.Unique, &idx.Definition, &colsCSV); err != nil {
+				return fmt.Errorf("scan index: %w", err)
+			}
+			if colsCSV != "" {
+				idx.Columns = strings.Split(colsCSV, ",")
+			} else {
+				idx.Columns = make([]string, 0)
+			}
+			result.Indexes = append(result.Indexes, idx)
+		}
+		if err := idxRows.Err(); err != nil {
+			return fmt.Errorf("iterate indexes: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ExplainQuery will be implemented in Phase 4.
